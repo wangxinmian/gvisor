@@ -17,6 +17,7 @@ package v1
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,19 +52,19 @@ func New(ctx context.Context, id string, publisher shim.Publisher, cancel func()
 		opts = ctxOpts.(shim.Opts)
 	}
 
-	runsc, err := runsc.New(ctx, id, publisher)
+	var shimAddress string
+	if address, err := shim.ReadAddress(shimAddressPath); err == nil {
+		shimAddress = address
+	}
+
+	runsc, err := runsc.New(ctx, id, publisher, cancel, shimAddress)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	s := &service{
 		genericOptions: opts,
-		cancel:         cancel,
 		main:           runsc,
-	}
-
-	if address, err := shim.ReadAddress(shimAddressPath); err == nil {
-		s.shimAddress = address
 	}
 
 	return s, nil
@@ -86,13 +87,6 @@ type service struct {
 	// genericOptions are options that come from the shim interface and are common
 	// to all shims.
 	genericOptions shim.Opts
-
-	// cancel is a function that needs to be called before the shim stops. The
-	// function is provided by the caller to New().
-	cancel func()
-
-	// shimAddress is the location of the UDS used to communicate to containerd.
-	shimAddress string
 
 	// main is the extension.TaskServiceExt that is used for all calls to the
 	// container's shim, except for the cases where `ext` is set.
@@ -152,14 +146,45 @@ func (s *service) newCommand(ctx context.Context, containerdBinary, containerdAd
 	return cmd, nil
 }
 
+// TODO: Add runsc annotation to identify grouping.
+var groupLabels = []string{
+	"io.kubernetes.cri.sandbox-id",
+}
+
+type spec struct {
+	// Annotations contains arbitrary metadata for the container.
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
 func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (string, error) {
 	log.L.Debugf("StartShim, id: %s, binary: %q, address: %q", opts.ID, opts.ContainerdBinary, opts.Address)
+
+	grouping := opts.ID
+
+	// Check for group annotations in the spec and update the grouping.
+	configFile, err := os.Open("config.json")
+	if err != nil {
+		return "", err
+	}
+	var readSpec spec
+	if err := json.NewDecoder(configFile).Decode(&readSpec); err != nil {
+		return "", err
+	}
+	for _, group := range groupLabels {
+		if groupID, ok := readSpec.Annotations[group]; ok {
+			grouping = groupID
+			log.L.Infof("group label found %v: %v", group, groupID)
+			break
+		} else {
+			log.L.Infof("group label not found")
+		}
+	}
 
 	cmd, err := s.newCommand(ctx, opts.ContainerdBinary, opts.Address)
 	if err != nil {
 		return "", err
 	}
-	address, err := shim.SocketAddress(ctx, opts.Address, opts.ID)
+	address, err := shim.SocketAddress(ctx, opts.Address, grouping)
 	if err != nil {
 		return "", err
 	}
@@ -188,6 +213,7 @@ func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (string, e
 	cu := cleanup.Make(func() {
 		socket.Close()
 		_ = shim.RemoveSocket(address)
+		configFile.Close()
 	})
 	defer cu.Clean()
 
@@ -345,12 +371,7 @@ func (s *service) Shutdown(ctx context.Context, r *taskapi.ShutdownRequest) (*ty
 		return resp, errdefs.ToGRPC(err)
 	}
 
-	s.cancel()
-	if len(s.shimAddress) != 0 {
-		_ = shim.RemoveSocket(s.shimAddress)
-	}
-	os.Exit(0)
-	panic("Should not get here")
+	return resp, errdefs.ToGRPC(err)
 }
 
 func (s *service) Stats(ctx context.Context, r *taskapi.StatsRequest) (*taskapi.StatsResponse, error) {
