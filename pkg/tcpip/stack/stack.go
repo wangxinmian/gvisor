@@ -2524,3 +2524,22 @@ const (
 func RestoreStackFromContext(ctx context.Context) *Stack {
 	return ctx.Value(CtxRestoreStack).(*Stack)
 }
+
+// beforeSave is invoked by stateify.
+func (s *Stack) beforeSave() {
+	// Remove all the NICs and routes from the stack as they will be
+	// created again during restore based on the new network config.
+	s.mu.Lock()
+	deferActs := make([]func(), 0)
+	for id := range s.nics {
+		act, _ := s.removeNICLocked(id)
+		if act != nil {
+			deferActs = append(deferActs, act)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, act := range deferActs {
+		act()
+	}
+}
